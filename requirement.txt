@@ -1,0 +1,11 @@
+solana==0.25.0
+spl-token==3.2.0
+python-telegram-bot==20.3
+aiohttp==3.8.4
+pinatapy==1.1.0
+base64
+logging
+json
+asyncio
+re
+time
