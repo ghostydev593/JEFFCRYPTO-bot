@@ -11,7 +11,7 @@ SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 # Pinata API Keys
 PINATA_API_KEY = "bdb05964611c673ad5f5"
-PINATA_SECRET_API_KEY = "YourPinataSecretAPIKeyed6c8a2734efe645414033da680b348ce6bb32e92a8b673479ba09df1376c7c0''
+PINATA_SECRET_API_KEY = "ed6c8a2734efe645414033da680b348ce6bb32e92a8b673479ba09df1376c7c0''
 
 
 
