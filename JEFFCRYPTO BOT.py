@@ -4,6 +4,7 @@ import time
 import json
 import asyncio
 import re
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,6 +19,7 @@ from aiohttp import ClientSession
 from pinatapy import PinataPy
 from solana_utils import SolanaUtils
 from solana.publickey import PublicKey
+from functools import lru_cache
 
 # Import settings from config.py
 from config import (
@@ -26,6 +28,7 @@ from config import (
     SOLANA_RPC_URL,
     PINATA_API_KEY,
     PINATA_SECRET_API_KEY,
+    ADMIN_IDS,
 )
 
 # Initialize logging with structured logging
@@ -45,10 +48,13 @@ pinata = PinataPy(PINATA_API_KEY, PINATA_SECRET_API_KEY)
 temporary_storage = {}
 
 # Conversation states
-NAME, SYMBOL, DECIMALS, SUPPLY, IMAGE, PHANTOM_WALLET, REVOKE_AUTHORITIES = range(7)
+NAME, SYMBOL, DECIMALS, SUPPLY, IMAGE, DESCRIPTION, PHANTOM_WALLET, DISABLE_SELLING, REVOKE_AUTHORITIES = range(9)
 
 # Dictionary to store authenticated users
 authenticated_users = {}
+
+# Admin override feature
+ADMIN_IDS = ADMIN_IDS  # Use admin IDs from config
 
 # Utility function for retries with exponential backoff
 async def retry_async(func, max_retries=3, delay=1, **kwargs):
@@ -79,12 +85,14 @@ def validate_metadata(metadata: dict) -> bool:
         if (not isinstance(metadata.get("initial_supply"), int) or
             metadata["initial_supply"] < 0 or metadata["initial_supply"] > 10**18):
             return False
+        # Description is optional, so no validation needed
         return True
     except Exception as error:
         logger.error(json.dumps({"error": "validate_metadata", "message": str(error)}))
         return False
 
-# Fetch token metadata
+# Cache frequently used token metadata with a time-based expiry
+@lru_cache(maxsize=100)
 async def fetch_token_metadata(token_address: str) -> dict:
     """Fetch token metadata from Metaplex API."""
     try:
@@ -104,6 +112,7 @@ async def fetch_token_metadata(token_address: str) -> dict:
                             logger.error("Unexpected or empty metadata format received.")
                             return None
                         try:
+                            # Try decoding as base64
                             decoded_metadata = base64.b64decode(metadata).decode()
                             parsed_metadata = json.loads(decoded_metadata)
                             return {
@@ -111,11 +120,12 @@ async def fetch_token_metadata(token_address: str) -> dict:
                                 "symbol": parsed_metadata.get("symbol", "N/A"),
                                 "decimals": parsed_metadata.get("decimals", 0),
                                 "total_supply": parsed_metadata.get("total_supply", 0),
+                                "description": parsed_metadata.get("description", ""),
                                 "image_url": parsed_metadata.get("image_url", None),
                             }
-                        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                            logger.error(json.dumps({"error": "fetch_token_metadata", "message": str(error)}))
-                            return {"raw_metadata": decoded_metadata}  # Return raw metadata if parsing fails
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            # Fallback: Return raw metadata if parsing fails
+                            return {"raw_metadata": metadata}
         return None
     except Exception as error:
         logger.error(json.dumps({"error": "fetch_token_metadata", "message": str(error)}))
@@ -144,6 +154,31 @@ async def upload_image_to_ipfs(image_url: str) -> str:
             return None
     return await retry_async(_upload, max_retries=3, delay=2)
 
+# Batch upload images to IPFS with rate limiting
+async def upload_images_to_ipfs(image_urls: list) -> list:
+    """Upload multiple images to IPFS using Pinata with rate limiting."""
+    async def _upload():
+        try:
+            async with ClientSession() as session:
+                files = []
+                for image_url in image_urls:
+                    async with session.get(image_url, timeout=10) as response:
+                        response.raise_for_status()
+                        image_data = await response.read()
+                        files.append(("file", ("image.png", image_data)))
+                headers = {
+                    "pinata_api_key": PINATA_API_KEY,
+                    "pinata_secret_api_key": PINATA_SECRET_API_KEY,
+                }
+                async with session.post("https://api.pinata.cloud/pinning/pinFileToIPFS", data=files, headers=headers, timeout=10) as ipfs_response:
+                    ipfs_response.raise_for_status()
+                    ipfs_data = await ipfs_response.json()
+                    return [f"https://ipfs.io/ipfs/{ipfs_data.get('IpfsHash', '')}" for _ in image_urls]
+        except Exception as error:
+            logger.error(f"Failed to upload images to IPFS: {error}")
+            return None
+    return await retry_async(_upload, max_retries=3, delay=2)
+
 # Start command
 async def start(update: Update, context: CallbackContext) -> int:
     """Start the bot and ask for a password."""
@@ -162,7 +197,7 @@ async def check_password(update: Update, context: CallbackContext) -> int:
     user_id = update.message.from_user.id
     password_attempt = update.message.text.strip()
 
-    if password_attempt == BOT_PASSWORD:
+    if password_attempt == BOT_PASSWORD or user_id in ADMIN_IDS:
         authenticated_users[user_id] = True
         await update.message.reply_text("✅ Authentication successful! You can now use the bot.")
         return MENU
@@ -224,6 +259,12 @@ async def create_token_supply(update: Update, context: CallbackContext) -> int:
 async def create_token_image(update: Update, context: CallbackContext) -> int:
     """Handle token image input."""
     context.user_data["image_url"] = update.message.text
+    await update.message.reply_text("Please enter a description for the token (optional):")
+    return DESCRIPTION
+
+async def create_token_description(update: Update, context: CallbackContext) -> int:
+    """Handle token description input."""
+    context.user_data["description"] = update.message.text
     metadata = context.user_data
 
     if not validate_metadata(metadata):
@@ -246,10 +287,18 @@ async def create_token_phantom_wallet(update: Update, context: CallbackContext) 
 
     # Create and send transaction
     mint_address, deep_link = await solana_utils.create_and_send_transaction(
-        context.user_data, PublicKey(phantom_wallet_address)
+        context.user_data, PublicKey(phantom_wallet_address))
     if not mint_address:
         error_message = deep_link if deep_link else "Failed to create token. Possible reasons:\n- Insufficient SOL balance\n- RPC connection issues\n- Metadata errors"
         await update.message.reply_text(error_message)
+        return ConversationHandler.END
+
+    # Wait for transaction confirmation
+    await asyncio.sleep(5)  # Give time for confirmation
+
+    # Check on-chain status before finalizing
+    if not await solana_utils.confirm_transaction(mint_address):
+        await update.message.reply_text("Transaction not confirmed. Please check your wallet.")
         return ConversationHandler.END
 
     # Store mint_address in context.user_data
@@ -267,6 +316,7 @@ async def create_token_phantom_wallet(update: Update, context: CallbackContext) 
         "user_id": update.message.from_user.id,
         "deep_link": deep_link,
         "image_url": context.user_data.get("image_url"),
+        "description": context.user_data.get("description", ""),
         "total_supply": context.user_data.get("initial_supply"),
         "created_at": time.time(),
     }
@@ -278,17 +328,69 @@ async def create_token_phantom_wallet(update: Update, context: CallbackContext) 
         f"Symbol: {context.user_data['symbol']}\n"
         f"Decimals: {context.user_data['decimals']}\n"
         f"Initial Supply: {context.user_data['initial_supply']}\n"
+        f"Description: {context.user_data.get('description', 'N/A')}\n"
         f"Token Address: {mint_address}\n\n"
         f"Click the link below to sign the transaction with Phantom:\n"
         f"{deep_link}",
         parse_mode="MarkdownV2",
     )
 
-    # Prompt to revoke authorities
+    # Prompt to disable selling
     await update.message.reply_text(
-        "After deploying the token, do you want to revoke freeze authority, mint authority, and update authority? (yes/no)"
+        "Do you want to disable selling for a specific duration? (yes/no)\n"
+        "If yes, enter the number of days (1-7):"
     )
-    return REVOKE_AUTHORITIES
+    return DISABLE_SELLING
+
+async def disable_selling_duration(update: Update, context: CallbackContext) -> int:
+    """Handle disable selling duration input."""
+    try:
+        days = int(update.message.text)
+        if days < 1 or days > 7:
+            await update.message.reply_text("Duration must be between 1 and 7 days.")
+            return DISABLE_SELLING
+
+        # Calculate the lock_until timestamp
+        lock_until = int((datetime.now() + timedelta(days=days)).timestamp())
+        context.user_data["disable_selling_end_date"] = lock_until
+
+        # Get mint address and Phantom wallet address
+        mint_address = context.user_data.get("mint_address")
+        phantom_wallet_address = context.user_data.get("phantom_wallet_address")
+
+        if not mint_address or not phantom_wallet_address:
+            await update.message.reply_text("Error: Missing mint address or Phantom wallet address.")
+            return ConversationHandler.END
+
+        # Blacklist the token on Raydium
+        success = await solana_utils.blacklist_on_raydium(PublicKey(mint_address))
+        if not success:
+            await update.message.reply_text("❌ Failed to blacklist token on Raydium.")
+            return ConversationHandler.END
+
+        # Notify the user
+        await update.message.reply_text(
+            f"✅ Selling is disabled until {datetime.fromtimestamp(lock_until).strftime('%Y-%m-%d %H:%M:%S')}.\n"
+            f"Token {mint_address} has been blacklisted on Raydium."
+        )
+
+        # Guide users on creating liquidity pools
+        await update.message.reply_text(
+            "📢 To allow users to buy your token, create a liquidity pool manually on Raydium:\n"
+            "1️⃣ Go to https://raydium.io/\n"
+            "2️⃣ Select 'Create a Liquidity Pool'\n"
+            "3️⃣ Add your token and SOL/USDC as the pair\n"
+            "4️⃣ Once the pool is live, users can buy your token!"
+        )
+
+        # Proceed to revoke authorities prompt
+        await update.message.reply_text(
+            "After deploying the token, do you want to revoke freeze authority, mint authority, and update authority? (yes/no)"
+        )
+        return REVOKE_AUTHORITIES
+    except ValueError:
+        await update.message.reply_text("Invalid input. Please enter a valid number of days (1-7).")
+        return DISABLE_SELLING
 
 async def revoke_authorities_prompt(update: Update, context: CallbackContext) -> int:
     """Handle revoke authorities prompt."""
@@ -304,8 +406,7 @@ async def revoke_authorities_prompt(update: Update, context: CallbackContext) ->
 
         # Generate revoke authorities Deep Link
         revoke_deep_link = await solana_utils.revoke_authorities(
-            PublicKey(mint_address), PublicKey(phantom_wallet_address)
-        )
+            PublicKey(mint_address), PublicKey(phantom_wallet_address))
         if not revoke_deep_link:
             await update.message.reply_text("Failed to generate revoke authorities transaction. ❌")
             return ConversationHandler.END
@@ -380,10 +481,6 @@ async def copy_token_phantom_wallet(update: Update, context: CallbackContext) ->
         await update.message.reply_text("Error: Failed to retrieve token metadata. Please try again.")
         return ConversationHandler.END
 
-    if not metadata.get("symbol") or not metadata.get("total_supply"):
-        await update.message.reply_text("Error: Incomplete or missing token metadata. Please verify the token address.")
-        return ConversationHandler.END
-
     # Ensure metadata["total_supply"] exists
     required_fields = ["total_supply", "decimals", "symbol"]
     missing_fields = [field for field in required_fields if field not in metadata]
@@ -394,8 +491,7 @@ async def copy_token_phantom_wallet(update: Update, context: CallbackContext) ->
 
     # Create and send transaction
     mint_address, deep_link = await solana_utils.create_and_send_transaction(
-        metadata, PublicKey(phantom_wallet_address)
-    )
+        metadata, PublicKey(phantom_wallet_address))
     if not mint_address:
         error_message = deep_link if deep_link else "Failed to copy token. Possible reasons:\n- Insufficient SOL balance\n- RPC connection issues\n- Metadata errors"
         await update.message.reply_text(error_message)
@@ -404,10 +500,9 @@ async def copy_token_phantom_wallet(update: Update, context: CallbackContext) ->
     # Wait for transaction confirmation
     await asyncio.sleep(5)  # Give time for confirmation
 
-    # Fetch transaction info
-    transaction_info = await solana_utils.client.get_confirmed_transaction(mint_address)
-    if not transaction_info:
-        await update.message.reply_text("Error: Transaction not confirmed. Please check your wallet.")
+    # Check on-chain status before finalizing
+    if not await solana_utils.confirm_transaction(mint_address):
+        await update.message.reply_text("Transaction not confirmed. Please check your wallet.")
         return ConversationHandler.END
 
     # Store mint_address in context.user_data
@@ -425,6 +520,7 @@ async def copy_token_phantom_wallet(update: Update, context: CallbackContext) ->
         "user_id": update.message.from_user.id,
         "deep_link": deep_link,
         "image_url": context.user_data.get("new_image_url"),
+        "description": metadata.get("description", ""),
         "total_supply": metadata.get("total_supply"),
         "created_at": time.time(),
     }
@@ -436,17 +532,19 @@ async def copy_token_phantom_wallet(update: Update, context: CallbackContext) ->
         f"Symbol: {metadata['symbol']}\n"
         f"Decimals: {metadata['decimals']}\n"
         f"Initial Supply: {metadata['total_supply']}\n"
+        f"Description: {metadata.get('description', 'N/A')}\n"
         f"Token Address: {mint_address}\n\n"
         f"Click the link below to sign the transaction with Phantom:\n"
         f"{deep_link}",
         parse_mode="MarkdownV2",
     )
 
-    # Prompt to revoke authorities
+    # Prompt to disable selling
     await update.message.reply_text(
-        "After deploying the token, do you want to revoke freeze authority, mint authority, and update authority? (yes/no)"
+        "Do you want to disable selling for a specific duration? (yes/no)\n"
+        "If yes, enter the number of days (1-7):"
     )
-    return REVOKE_AUTHORITIES
+    return DISABLE_SELLING
 
 # Token info command
 async def token_info(update: Update, context: CallbackContext) -> None:
@@ -467,11 +565,13 @@ async def token_info(update: Update, context: CallbackContext) -> None:
             f"Symbol: {metadata.get('symbol')}\n"
             f"Decimals: {metadata.get('decimals')}\n"
             f"Total Supply: {metadata.get('total_supply')}\n"
+            f"Description: {metadata.get('description', 'N/A')}\n"
             f"Image URL: {metadata.get('image_url', 'N/A')}",
             parse_mode="MarkdownV2",
         )
     except Exception as error:
-        logger.error(json.dumps({"error": "token_info", "message": str(error)}))await update.message.reply_text("Failed to fetch token info. Please try again. ❌")
+        logger.error(json.dumps({"error": "token_info", "message": str(error)}))
+        await update.message.reply_text("Failed to fetch token info. Please try again. ❌")
 
 # Help command
 async def help_command(update: Update, context: CallbackContext) -> None:
@@ -520,7 +620,9 @@ def main() -> None:
             DECIMALS: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_decimals)],
             SUPPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_supply)],
             IMAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_image)],
+            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_description)],
             PHANTOM_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_phantom_wallet)],
+            DISABLE_SELLING: [MessageHandler(filters.TEXT & ~filters.COMMAND, disable_selling_duration)],
             REVOKE_AUTHORITIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, revoke_authorities_prompt)],
         },
         fallbacks=[],
@@ -532,6 +634,7 @@ def main() -> None:
         entry_points=[CommandHandler("copy", copy_token)],
         states={
             PHANTOM_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, copy_token_phantom_wallet)],
+            DISABLE_SELLING: [MessageHandler(filters.TEXT & ~filters.COMMAND, disable_selling_duration)],
             REVOKE_AUTHORITIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, revoke_authorities_prompt)],
         },
         fallbacks=[],
@@ -546,4 +649,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-       
