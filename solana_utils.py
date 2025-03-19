@@ -2,91 +2,50 @@ from solana.rpc.async_api import AsyncClient
 from solana.publickey import PublicKey
 from solana.transaction import Transaction
 from solana.keypair import Keypair
+from solana.system_program import CreateAccountParams, create_account
+from solana.sysvar import SYSVAR_RENT_PUBKEY
+from solana.instruction import Instruction, AccountMeta
+from solana.system_program import SYS_PROGRAM_ID
 from spl.token.constants import TOKEN_PROGRAM_ID
 from spl.token.instructions import create_mint, create_associated_token_account, mint_to, set_authority, AuthorityType
 from spl.token.async_client import Token
 import base64
 import logging
 import json
+import aiohttp
+import time
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
 class SolanaUtils:
     def __init__(self, rpc_url: str):
-        self.client = AsyncClient(rpc_url, commitment="confirmed")  # Added commitment="confirmed"
+        self.client = AsyncClient(rpc_url, commitment="confirmed")
 
-    async def create_and_send_transaction(self, metadata: dict, payer_public_key: PublicKey) -> tuple:
-        """Create and send a transaction for token creation."""
-        try:
-            # Validate metadata before proceeding
-            required_fields = ["decimals", "initial_supply"]
-            missing_fields = [field for field in required_fields if field not in metadata]
-
-            if missing_fields:
-                return None, f"Error: Missing metadata fields: {', '.join(missing_fields)}"
-
-            # Check payer's SOL balance
+    async def blacklist_on_raydium(self, mint_address: PublicKey) -> bool:
+        """Blacklist the token on Raydium to prevent selling."""
+        endpoints = [
+            "https://api.raydium.io/v1/blacklist",  # Primary endpoint
+            "https://backup.raydium.io/v1/blacklist",  # Fallback endpoint
+        ]
+        for endpoint in endpoints:
             try:
-                balance_response = await self.client.get_balance(payer_public_key)
-                balance = balance_response.get("result", {}).get("value", 0)
+                async with aiohttp.ClientSession() as session:
+                    response = await session.post(
+                        endpoint,
+                        json={"token_address": str(mint_address)},
+                        timeout=10
+                    )
+                    if response.status == 200:
+                        logger.info(f"Token {mint_address} blacklisted on Raydium.")
+                        return True
+                    else:
+                        logger.error(f"Failed to blacklist token on Raydium ({endpoint}): {response.status}")
+                        await asyncio.sleep(2)  # Delay before retrying with the next endpoint
             except Exception as error:
-                logger.error(json.dumps({"error": "get_balance", "message": str(error)}))
-                return None, "Error: Unable to connect to Solana RPC. Try again later."
-
-            # Assuming minimum 0.002 SOL for transaction fees and account rent
-            min_balance_required = 200_000  # 0.002 SOL in lamports
-            if balance < min_balance_required:
-                logger.error("Insufficient SOL balance for transaction.")
-                return None, "Error: Insufficient SOL balance. Please fund your wallet."
-
-            # Proceed with token creation
-            mint = Keypair.generate()
-            transaction = Transaction()
-            transaction.add(
-                create_mint(
-                    mint=mint.public_key,
-                    mint_authority=payer_public_key,
-                    decimals=metadata["decimals"],
-                    program_id=TOKEN_PROGRAM_ID,
-                )
-            )
-
-            # Create associated token account for the user
-            associated_token_account = create_associated_token_account(
-                payer=payer_public_key,
-                owner=payer_public_key,
-                mint=mint.public_key,
-                program_id=TOKEN_PROGRAM_ID,
-            )
-            transaction.add(associated_token_account)
-
-            # Check if the associated token account exists
-            token_client = Token(self.client, mint.public_key, TOKEN_PROGRAM_ID, payer_public_key)
-            user_token_account = await token_client.get_associated_token_address(payer_public_key)
-
-            account_info = await self.client.get_account_info(user_token_account)
-            if account_info["result"]["value"] is None:
-                return None, "Error: Associated token account does not exist. Please create one."
-
-            # Mint tokens directly to the user's wallet
-            transaction.add(
-                mint_to(
-                    mint=mint.public_key,
-                    dest=payer_public_key,  # ✅ Sends tokens directly to user's Phantom wallet
-                    mint_authority=payer_public_key,
-                    amount=metadata["initial_supply"],
-                )
-            )
-
-            # Generate Phantom deep link for the transaction
-            deep_link = await self.generate_phantom_deep_link(transaction)
-            if not deep_link:
-                raise Exception("Failed to generate Phantom Deep Link")
-
-            return mint.public_key, deep_link
-        except Exception as error:
-            logger.error(json.dumps({"error": "create_and_send_transaction", "message": str(error)}))
-            return None, None
+                logger.error(json.dumps({"error": "blacklist_on_raydium", "message": str(error)}))
+                await asyncio.sleep(2)  # Delay before retrying with the next endpoint
+        return False
 
     async def generate_phantom_deep_link(self, transaction: Transaction) -> str:
         """Generate a Phantom Deep Link with validation."""
@@ -105,38 +64,42 @@ class SolanaUtils:
                 logger.error("Transaction too large for Phantom Deep Link.")
                 return None  # Return None instead of a string
 
+            # Additional security checks
+            if not self.validate_transaction(transaction):
+                logger.error("Transaction failed security checks.")
+                return None
+
             return f"https://phantom.app/ul/v1/?tx={base64_txn}&type=transaction"  # Improved Phantom link format
         except ValueError as error:
             logger.error(json.dumps({"error": "phantom_deep_link", "message": str(error)}))
             return None
 
-    async def revoke_authorities(self, mint_address: PublicKey, owner_address: PublicKey) -> str:
-        """Generate a transaction to revoke mint, freeze, and update authority."""
+    def validate_transaction(self, transaction: Transaction) -> bool:
+        """Validate transaction for security."""
         try:
-            transaction = Transaction()
-            transaction.add(
-                set_authority(
-                    mint=mint_address,
-                    authority_type=AuthorityType.MintTokens,  # Corrected
-                    new_authority=None,
-                    current_authority=owner_address,
-                )
-            )
-            transaction.add(
-                set_authority(
-                    mint=mint_address,
-                    authority_type=AuthorityType.FreezeAccount,  # Corrected
-                    new_authority=None,
-                    current_authority=owner_address,
-                )
-            )
+            # Check if the transaction has valid instructions
+            if not transaction.message.instructions:
+                return False
 
-            # Check if the transaction is empty
-            if not transaction.instructions:
-                logger.error("Transaction is empty. Cannot revoke authorities.")
-                return None
+            # Verify signatures
+            if not transaction.verify_signatures():
+                logger.error(f"Transaction signature verification failed. Details: {transaction.signatures}")
+                return False
 
-            return await self.generate_phantom_deep_link(transaction)
+            # Add additional checks here (e.g., valid program IDs, etc.)
+            return True
         except Exception as error:
-            logger.error(json.dumps({"error": "revoke_authorities", "message": str(error)}))
-            return None
+            logger.error(json.dumps({"error": "validate_transaction", "message": str(error)}))
+            return False
+
+    async def confirm_transaction(self, txid: str) -> bool:
+        """Confirm that a transaction is on-chain."""
+        try:
+            # Check transaction status
+            confirmation = await self.client.get_confirmed_transaction(txid)
+            if confirmation and confirmation.get("result"):
+                return True
+            return False
+        except Exception as error:
+            logger.error(json.dumps({"error": "confirm_transaction", "message": str(error)}))
+            return False
