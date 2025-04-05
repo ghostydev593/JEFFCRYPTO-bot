@@ -2,7 +2,7 @@
 TELEGRAM_BOT_TOKEN = "8119277927:AAH4QBtmm-Fx_pJ5DYlDjArVgwG9xJFcUn4"
 
 # Bot Password for Authentication
-BOT_PASSWORD = "sammy2525"
+BOT_PASSWORD = "sammy2525$"
 
 # Solana RPC URL
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"  # Replace with your RPC URL
