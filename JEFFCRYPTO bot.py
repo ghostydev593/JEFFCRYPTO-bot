@@ -8,7 +8,13 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple, Any, Union
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -18,7 +24,7 @@ from telegram.ext import (
     ConversationHandler,
     CallbackQueryHandler
 )
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientWebSocketResponse
 from pinatapy import PinataPy
 from solana_utils import SolanaUtils
 from solana.publickey import PublicKey
@@ -54,14 +60,8 @@ pinata = PinataPy(PINATA_API_KEY, PINATA_SECRET_API_KEY)
 # State management
 temporary_storage = {}
 authenticated_users = {}
-user_edit_states = {}  # Stores metadata being edited
-
-# Conversation states
-(
-    PASSWORD, MENU, NAME, SYMBOL, DECIMALS, SUPPLY, 
-    IMAGE, DESCRIPTION, PHANTOM_WALLET, DISABLE_SELLING, 
-    REVOKE_AUTHORITIES, PREVIEW, EDIT_CHOICE, EDIT_FIELD
-) = range(14)
+user_edit_states = {}
+tx_monitor_tasks = {}
 
 # Constants
 MAX_RETRIES = 3
@@ -71,7 +71,21 @@ MAX_NAME_LENGTH = 30
 MAX_SYMBOL_LENGTH = 10
 MAX_DESCRIPTION_LENGTH = 200
 
-# Helper Functions
+EXPLORER_URLS = {
+    'Solscan': 'https://solscan.io/token/{}',
+    'SolanaFM': 'https://solana.fm/address/{}',
+    'Dexlab': 'https://dexlab.space/token/{}',
+    'Raydium': 'https://raydium.io/swap/?inputCurrency={}'
+}
+
+# Conversation states
+(
+    PASSWORD, MENU, NAME, SYMBOL, DECIMALS_CHOICE, SUPPLY, 
+    IMAGE, DESCRIPTION, PHANTOM_WALLET, DISABLE_SELLING_CHOICE,
+    DISABLE_DAYS, REVOKE_AUTHORITIES_CHOICE, PREVIEW, 
+    EDIT_CHOICE, EDIT_FIELD, POST_CREATION_ACTIONS
+) = range(16)
+
 async def show_progress(context: CallbackContext, chat_id: int, message: str) -> Any:
     """Show progress to user."""
     msg = await context.bot.send_message(
@@ -96,39 +110,27 @@ async def create_inline_keyboard(options: List[str], columns: int = 2) -> Inline
         buttons.append([InlineKeyboardButton(text=opt, callback_data=opt) for opt in row])
     return InlineKeyboardMarkup(buttons)
 
-async def upload_to_ipfs(image_url: str, is_batch: bool = False) -> Optional[Union[str, List[str]]]:
-    """Handle both single and batch image uploads to IPFS with retries."""
-    async def _upload_single(url: str) -> Optional[str]:
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with ClientSession() as session:
-                    async with session.get(url, timeout=10) as response:
-                        if response.status != 200:
-                            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-                            continue
-                        
-                        image_data = await response.read()
-                        if len(image_data) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
-                            return None
-                        
-                        result = pinata.pin_file_to_ipfs(image_data)
-                        return f"https://ipfs.io/ipfs/{result['IpfsHash']}"
-            except Exception as e:
-                logger.error(f"Upload attempt {attempt + 1} failed: {str(e)}")
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-        return None
-
-    if is_batch:
-        results = []
-        for url in image_url:
-            result = await _upload_single(url)
-            if result:
-                results.append(result)
-            await asyncio.sleep(1)  # Rate limit between uploads
-        return results if results else None
-    else:
-        return await _upload_single(image_url)
+async def upload_to_ipfs(image_url: str) -> Optional[str]:
+    """Handle image uploads to IPFS with retries."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with ClientSession() as session:
+                async with session.get(image_url, timeout=10) as response:
+                    if response.status != 200:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                        continue
+                    
+                    image_data = await response.read()
+                    if len(image_data) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
+                        return None
+                    
+                    result = pinata.pin_file_to_ipfs(image_data)
+                    return f"https://ipfs.io/ipfs/{result['IpfsHash']}"
+        except Exception as e:
+            logger.error(f"Upload attempt {attempt + 1} failed: {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+    return None
 
 def validate_metadata(metadata: Dict) -> Tuple[bool, Optional[str]]:
     """Validate token metadata with detailed error messages."""
@@ -165,16 +167,16 @@ def validate_metadata(metadata: Dict) -> Tuple[bool, Optional[str]]:
         logger.error(f"Validation error: {str(error)}")
         return False, "Invalid metadata format"
 
-# Bot Handlers
 async def start(update: Update, context: CallbackContext) -> int:
-    """Start command with inline keyboard."""
+    """Start command with enhanced inline keyboard."""
     user_id = update.message.from_user.id
     
     if user_id in authenticated_users:
         keyboard = [
-            [InlineKeyboardButton("Create Token", callback_data='create')],
-            [InlineKeyboardButton("Copy Token", callback_data='copy')],
-            [InlineKeyboardButton("Token Info", callback_data='info')]
+            [InlineKeyboardButton("🆕 Create Token", callback_data='create')],
+            [InlineKeyboardButton("©️ Copy Token", callback_data='copy')],
+            [InlineKeyboardButton("ℹ️ Token Info", callback_data='info')],
+            [InlineKeyboardButton("📊 My Tokens", callback_data='my_tokens')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -201,9 +203,10 @@ async def check_password(update: Update, context: CallbackContext) -> int:
                 json.dump(ADMIN_IDS, f)
 
         keyboard = [
-            [InlineKeyboardButton("Create Token", callback_data='create')],
-            [InlineKeyboardButton("Copy Token", callback_data='copy')],
-            [InlineKeyboardButton("Token Info", callback_data='info')]
+            [InlineKeyboardButton("🆕 Create Token", callback_data='create')],
+            [InlineKeyboardButton("©️ Copy Token", callback_data='copy')],
+            [InlineKeyboardButton("ℹ️ Token Info", callback_data='info')],
+            [InlineKeyboardButton("📊 My Tokens", callback_data='my_tokens')]
         ]
         await update.message.reply_text(
             "✅ Authentication successful! Choose an option:",
@@ -228,6 +231,8 @@ async def menu_handler(update: Update, context: CallbackContext) -> int:
     elif query.data == 'info':
         await query.edit_message_text("Please enter the token address for info:")
         return await token_info(update, context)
+    elif query.data == 'my_tokens':
+        return await show_user_tokens(update, context)
     
     return MENU
 
@@ -240,44 +245,104 @@ async def create_token_name(update: Update, context: CallbackContext) -> int:
 async def create_token_symbol(update: Update, context: CallbackContext) -> int:
     """Handle token symbol input."""
     context.user_data["symbol"] = update.message.text
-    await update.message.reply_text("Please enter the token decimals (0-18):")
-    return DECIMALS
+    
+    keyboard = [
+        [InlineKeyboardButton(str(i), callback_data=str(i)) for i in range(0, 6)],
+        [InlineKeyboardButton(str(i), callback_data=str(i)) for i in range(6, 12)],
+        [InlineKeyboardButton("Custom (0-18)", callback_data='custom')]
+    ]
+    
+    await update.message.reply_text(
+        "Select token decimals:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return DECIMALS_CHOICE
 
-async def create_token_decimals(update: Update, context: CallbackContext) -> int:
-    """Handle token decimals input."""
+async def handle_decimals_choice(update: Update, context: CallbackContext) -> int:
+    """Handle decimals selection."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'custom':
+        await query.edit_message_text("Enter custom decimals (0-18):")
+        return DECIMALS_CHOICE
+    
+    try:
+        decimals = int(query.data)
+        if 0 <= decimals <= 18:
+            context.user_data["decimals"] = decimals
+            await query.edit_message_text(f"Selected decimals: {decimals}\n\nEnter initial supply:")
+            return SUPPLY
+        else:
+            await query.edit_message_text("Invalid decimals. Please select 0-18:")
+            return DECIMALS_CHOICE
+    except ValueError:
+        await query.edit_message_text("Invalid input. Please try again.")
+        return DECIMALS_CHOICE
+
+async def handle_decimals_input(update: Update, context: CallbackContext) -> int:
+    """Handle custom decimals input."""
     try:
         decimals = int(update.message.text)
-        if decimals < 0 or decimals > 18:
-            await update.message.reply_text("Decimals must be between 0 and 18. Please try again.")
-            return DECIMALS
-        context.user_data["decimals"] = decimals
-        await update.message.reply_text("Please enter the initial supply:")
-        return SUPPLY
+        if 0 <= decimals <= 18:
+            context.user_data["decimals"] = decimals
+            await update.message.reply_text(f"Set decimals to {decimals}\n\nEnter initial supply:")
+            return SUPPLY
+        else:
+            await update.message.reply_text("Decimals must be 0-18. Please try again:")
+            return DECIMALS_CHOICE
     except ValueError:
-        await update.message.reply_text("Invalid input. Please enter a number between 0 and 18.")
-        return DECIMALS
+        await update.message.reply_text("Invalid input. Please enter a number 0-18:")
+        return DECIMALS_CHOICE
 
 async def create_token_supply(update: Update, context: CallbackContext) -> int:
-    """Handle token supply input."""
+    """Handle token supply input with validation."""
     try:
         initial_supply = int(update.message.text)
         if initial_supply <= 0:
-            await update.message.reply_text("Supply must be positive. Please try again.")
+            await update.message.reply_text("Supply must be positive. Please try again:")
             return SUPPLY
+        
         context.user_data["initial_supply"] = initial_supply
-        await update.message.reply_text("Please enter the image URL (optional):")
+        
+        keyboard = [
+            [InlineKeyboardButton("Add Image", callback_data='add_image')],
+            [InlineKeyboardButton("Skip", callback_data='skip_image')]
+        ]
+        await update.message.reply_text(
+            "Would you like to add a token image?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return IMAGE
+        
     except ValueError:
-        await update.message.reply_text("Invalid input. Please enter a positive number.")
+        await update.message.reply_text("Invalid input. Please enter a positive number:")
         return SUPPLY
+
+async def handle_image_choice(update: Update, context: CallbackContext) -> int:
+    """Handle image choice selection."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'skip_image':
+        context.user_data["image_url"] = None
+        await query.edit_message_text("Skipped image. Please enter a description (optional):")
+        return DESCRIPTION
+    else:
+        await query.edit_message_text("Please enter the image URL:")
+        return IMAGE
 
 async def create_token_image(update: Update, context: CallbackContext) -> int:
     """Handle token image input."""
     image_url = update.message.text.strip()
-    if image_url and image_url.lower() != 'skip':
-        progress_msg = await show_progress(context, update.message.chat_id, "Uploading image to IPFS")
-        context.user_data["image_url"] = await upload_to_ipfs(image_url)
-        await update_progress(context, progress_msg, "Image uploaded")
+    if image_url.lower() in ['skip', 'none']:
+        context.user_data["image_url"] = None
+        await update.message.reply_text("Skipped image. Please enter a description (optional):")
+        return DESCRIPTION
+    
+    progress_msg = await show_progress(context, update.message.chat_id, "Uploading image to IPFS")
+    context.user_data["image_url"] = await upload_to_ipfs(image_url)
+    await update_progress(context, progress_msg, "Image uploaded")
     
     await update.message.reply_text("Please enter a description for the token (optional):")
     return DESCRIPTION
@@ -296,25 +361,32 @@ async def preview_metadata(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
     
     preview_text = (
-        f"📝 Metadata Preview:\n\n"
-        f"Name: {metadata.get('name')}\n"
-        f"Symbol: {metadata.get('symbol')}\n"
-        f"Decimals: {metadata.get('decimals')}\n"
-        f"Supply: {metadata.get('initial_supply')}\n"
-        f"Image: {metadata.get('image_url', 'None')}\n"
-        f"Description: {metadata.get('description', 'None')}\n\n"
+        f"📝 Token Metadata Preview:\n\n"
+        f"🔹 Name: {metadata.get('name')}\n"
+        f"🔸 Symbol: {metadata.get('symbol')}\n"
+        f"🔢 Decimals: {metadata.get('decimals')}\n"
+        f"💰 Initial Supply: {metadata.get('initial_supply'):,}\n"
+        f"🖼️ Image: {metadata.get('image_url', 'None')}\n"
+        f"📄 Description: {metadata.get('description', 'None')}\n\n"
         f"Does this look correct?"
     )
     
     keyboard = [
-        [InlineKeyboardButton("✅ Confirm", callback_data='confirm')],
-        [InlineKeyboardButton("✏️ Edit", callback_data='edit')],
+        [InlineKeyboardButton("✅ Confirm & Create", callback_data='confirm')],
+        [InlineKeyboardButton("✏️ Edit Metadata", callback_data='edit')],
         [InlineKeyboardButton("❌ Cancel", callback_data='cancel')]
     ]
-    await update.message.reply_text(
-        preview_text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            preview_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            preview_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return PREVIEW
 
 async def handle_edit_choice(update: Update, context: CallbackContext) -> int:
@@ -344,9 +416,16 @@ async def edit_metadata_field(update: Update, context: CallbackContext) -> int:
     
     field = query.data
     context.user_data['editing_field'] = field
-    prompt = f"Enter new value for {field}:"
+    
     if field == 'image':
-        prompt += "\n(Send 'skip' to remove image)"
+        prompt = "Enter new image URL (or 'skip' to remove image):"
+    elif field == 'decimals':
+        prompt = "Enter new decimals (0-18):"
+    elif field == 'supply':
+        prompt = "Enter new initial supply:"
+    else:
+        prompt = f"Enter new {field}:"
+    
     await query.edit_message_text(prompt)
     return EDIT_FIELD
 
@@ -418,134 +497,161 @@ async def create_token_phantom_wallet(update: Update, context: CallbackContext) 
             "created_at": time.time(),
         }
         
+        # Start monitoring transaction
+        tx_monitor_tasks[str(mint_address)] = asyncio.create_task(
+            monitor_transaction_status(context, deep_link.split('tx=')[1].split('&')[0], update.message.chat_id, str(mint_address))
+        )
+        
         # Show success message
         await update.message.reply_text(
-            f"🎉 Token created successfully!\n\n"
+            f"🎉 Token creation initiated!\n\n"
             f"Token Address: `{mint_address}`\n\n"
             f"Click below to sign the transaction:\n"
-            f"{deep_link}",
+            f"{deep_link}\n\n"
+            f"I'll notify you when it's confirmed.",
             parse_mode="Markdown"
         )
         
-        # Ask about disabling selling
-        keyboard = [
-            [InlineKeyboardButton("Disable Selling", callback_data='disable')],
-            [InlineKeyboardButton("Skip", callback_data='skip_disable')]
-        ]
-        await update.message.reply_text(
-            "Would you like to disable selling for a period?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return DISABLE_SELLING
+        return POST_CREATION_ACTIONS
         
     except Exception as e:
         logger.error(f"Token creation failed: {str(e)}")
         await update.message.reply_text("❌ Failed to create token. Please try again.")
         return ConversationHandler.END
 
-async def disable_selling_duration(update: Update, context: CallbackContext) -> int:
-    """Handle disable selling duration input."""
+async def monitor_transaction_status(context: CallbackContext, txid: str, chat_id: int, mint_address: str) -> None:
+    """Monitor and update transaction status via websocket."""
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏳ Waiting for transaction confirmation..."
+    )
+    
+    result = await solana_utils.confirm_transaction(txid)
+    
+    explorer_links = "\n".join(
+        f"• [{name}]({url.format(mint_address)})" 
+        for name, url in EXPLORER_URLS.items()
+    )
+    
+    if result['status'] == 'confirmed':
+        await context.bot.edit_message_text(
+            text=(
+                f"✅ Transaction confirmed!\n\n"
+                f"🔗 Explorer Links:\n"
+                f"{explorer_links}\n\n"
+                f"What would you like to do next?"
+            ),
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+        
+        # Show post-creation actions
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Liquidity", callback_data=f'add_liquidity_{mint_address}')],
+            [
+                InlineKeyboardButton("🔍 View Token", callback_data=f'view_{mint_address}'),
+                InlineKeyboardButton("📊 My Tokens", callback_data='my_tokens')
+            ],
+            [InlineKeyboardButton("✅ Done", callback_data='done')]
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Select an option:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await context.bot.edit_message_text(
+            text=f"❌ Transaction failed: {result.get('error', 'Unknown error')}",
+            chat_id=chat_id,
+            message_id=status_msg.message_id
+        )
+
+async def handle_post_creation_actions(update: Update, context: CallbackContext) -> int:
+    """Handle actions after token creation."""
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'skip_disable':
-        await query.edit_message_text("Skipped disabling selling.")
-        return await prompt_revoke_authorities(update, context)
-    
-    await query.edit_message_text("How many days to disable selling? (1-7):")
-    return DISABLE_SELLING
-
-async def handle_disable_selling(update: Update, context: CallbackContext) -> int:
-    """Handle disable selling days input."""
-    try:
-        days = int(update.message.text)
-        if not 1 <= days <= 7:
-            await update.message.reply_text("Please enter a number between 1 and 7:")
-            return DISABLE_SELLING
-        
-        mint_address = context.user_data.get("mint_address")
-        wallet_address = context.user_data.get("phantom_wallet_address")
-        
-        if not mint_address or not wallet_address:
-            await update.message.reply_text("❌ Error: Missing token or wallet address")
-            return ConversationHandler.END
-        
-        progress_msg = await show_progress(context, update.message.chat_id, "Disabling selling")
-        deep_link = await solana_utils.disable_selling(
-            PublicKey(mint_address),
-            PublicKey(wallet_address),
-            days
+    if query.data.startswith('add_liquidity_'):
+        mint_address = query.data.split('_')[2]
+        await query.edit_message_text(
+            f"📌 To add liquidity to Raydium:\n\n"
+            f"1. Go to [Raydium Swap](https://raydium.io/swap/)\n"
+            f"2. Select your token: `{mint_address}`\n"
+            f"3. Follow the liquidity adding process\n\n"
+            f"Need help? Check the [Raydium Guide](https://docs.raydium.io/raydium/)",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
         )
-        
-        if not deep_link:
-            await update.message.reply_text("❌ Failed to disable selling")
-            return await prompt_revoke_authorities(update, context)
-        
-        await update_progress(context, progress_msg, "Selling disabled")
-        await update.message.reply_text(
-            f"✅ Selling disabled for {days} days\n\n"
-            f"Sign the transaction:\n{deep_link}"
+    elif query.data.startswith('view_'):
+        mint_address = query.data.split('_')[1]
+        explorer_links = "\n".join(
+            f"• [{name}]({url.format(mint_address)})" 
+            for name, url in EXPLORER_URLS.items()
         )
-        
-        return await prompt_revoke_authorities(update, context)
+        await query.edit_message_text(
+            f"🔍 Token Explorer Links:\n\n{explorer_links}",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+    elif query.data == 'my_tokens':
+        return await show_user_tokens(update, context)
+    else:
+        await query.edit_message_text("✅ Token creation process completed!")
     
-    except ValueError:
-        await update.message.reply_text("Please enter a valid number (1-7):")
-        return DISABLE_SELLING
+    return ConversationHandler.END
 
-async def prompt_revoke_authorities(update: Update, context: CallbackContext) -> int:
-    """Prompt user about revoking authorities."""
-    keyboard = [
-        [InlineKeyboardButton("Revoke Authorities", callback_data='revoke')],
-        [InlineKeyboardButton("Skip", callback_data='skip_revoke')]
+async def show_user_tokens(update: Update, context: CallbackContext) -> int:
+    """Show user's created tokens."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user_tokens = [
+        token for token in temporary_storage.values() 
+        if token['user_id'] == user_id
     ]
-    await update.message.reply_text(
-        "Revoke freeze/mint/update authorities?",
+    
+    if not user_tokens:
+        await query.edit_message_text("You haven't created any tokens yet!")
+        return ConversationHandler.END
+    
+    token_list = []
+    for i, token in enumerate(user_tokens, 1):
+        token_list.append(
+            f"{i}. {token['metadata']['name']} ({token['metadata']['symbol']})\n"
+            f"   Address: `{token['mint_address']}`\n"
+            f"   Created: {datetime.fromtimestamp(token['created_at']).strftime('%Y-%m-%d %H:%M')}"
+        )
+    
+    await query.edit_message_text(
+        f"📊 Your Tokens:\n\n" + "\n\n".join(token_list),
+        parse_mode="Markdown"
+    )
+    
+    # Show actions for each token
+    keyboard = []
+    for token in user_tokens[:5]:  # Limit to 5 tokens to avoid message size limits
+        keyboard.append([
+            InlineKeyboardButton(
+                f"View {token['metadata']['symbol']}",
+                callback_data=f"view_{token['mint_address']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("Back to Menu", callback_data='back')])
+    
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="Select a token to view:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    return REVOKE_AUTHORITIES
-
-async def handle_revoke_authorities(update: Update, context: CallbackContext) -> int:
-    """Handle revoke authorities choice."""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == 'skip_revoke':
-        await query.edit_message_text("Token creation complete!")
-        return ConversationHandler.END
-    
-    mint_address = context.user_data.get("mint_address")
-    wallet_address = context.user_data.get("phantom_wallet_address")
-    
-    if not mint_address or not wallet_address:
-        await query.edit_message_text("❌ Error: Missing token or wallet address")
-        return ConversationHandler.END
-    
-    progress_msg = await show_progress(context, query.message.chat_id, "Preparing authority revocation")
-    revoke_deep_link = await solana_utils.revoke_authorities(
-        PublicKey(mint_address),
-        PublicKey(wallet_address)
-    )
-    
-    if not revoke_deep_link:
-        await query.edit_message_text("❌ Failed to prepare revocation")
-        return ConversationHandler.END
-    
-    await update_progress(context, progress_msg, "Ready to revoke authorities")
-    await query.edit_message_text(
-        f"Click to revoke authorities:\n{revoke_deep_link}\n\n"
-        f"Token creation complete!"
-    )
-    return ConversationHandler.END
+    return POST_CREATION_ACTIONS
 
 async def copy_token(update: Update, context: CallbackContext) -> int:
     """Handle copy token command."""
     try:
-        if update.callback_query:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Please enter the token address to copy:")
-            return PHANTOM_WALLET
-        
         token_address = update.message.text.strip()
         progress_msg = await show_progress(context, update.message.chat_id, "Fetching token metadata")
         
@@ -584,15 +690,25 @@ async def token_info(update: Update, context: CallbackContext) -> int:
         
         info_text = (
             f"🔍 Token Info\n\n"
-            f"Name: {metadata.get('name', 'Unknown')}\n"
-            f"Symbol: {metadata.get('symbol', 'N/A')}\n"
-            f"Decimals: {metadata.get('decimals', 0)}\n"
-            f"Supply: {metadata.get('total_supply', 'N/A')}\n"
-            f"Description: {metadata.get('description', 'None')}\n"
-            f"Image: {metadata.get('image_url', 'None')}"
+            f"🔹 Name: {metadata.get('name', 'Unknown')}\n"
+            f"🔸 Symbol: {metadata.get('symbol', 'N/A')}\n"
+            f"🔢 Decimals: {metadata.get('decimals', 0)}\n"
+            f"💰 Supply: {metadata.get('total_supply', 'N/A'):,}\n"
+            f"📄 Description: {metadata.get('description', 'None')}\n"
+            f"🖼️ Image: {metadata.get('image_url', 'None')}\n\n"
+            f"🔗 Explorer Links:\n"
         )
         
-        await update.message.reply_text(info_text)
+        explorer_links = "\n".join(
+            f"• [{name}]({url.format(token_address)})" 
+            for name, url in EXPLORER_URLS.items()
+        )
+        
+        await update.message.reply_text(
+            info_text + explorer_links,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
         return ConversationHandler.END
     
     except Exception as e:
@@ -630,49 +746,6 @@ async def error_handler(update: Update, context: CallbackContext) -> None:
     except Exception as e:
         logger.error(f"Failed to send error message: {str(e)}")
 
-def main() -> None:
-    """Start the bot with all handlers."""
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Conversation handler for token creation
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)],
-            MENU: [CallbackQueryHandler(menu_handler)],
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_name)],
-            SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_symbol)],
-            DECIMALS: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_decimals)],
-            SUPPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_supply)],
-            IMAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_image)],
-            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_description)],
-            PREVIEW: [CallbackQueryHandler(handle_edit_choice)],
-            EDIT_CHOICE: [CallbackQueryHandler(edit_metadata_field)],
-            EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_edited_field)],
-            PHANTOM_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_phantom_wallet)],
-            DISABLE_SELLING: [
-                CallbackQueryHandler(disable_selling_duration, pattern='^disable$|^skip_disable$'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_disable_selling)
-            ],
-            REVOKE_AUTHORITIES: [
-                CallbackQueryHandler(handle_revoke_authorities, pattern='^revoke$|^skip_revoke$')
-            ],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-    )
-    
-    # Command handlers
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler('copy', copy_token))
-    app.add_handler(CommandHandler('tokeninfo', token_info))
-    app.add_handler(CommandHandler('help', help_command))
-    
-    # Error handler
-    app.add_error_handler(error_handler)
-    
-    # Start the bot
-    app.run_polling()
-
 async def help_command(update: Update, context: CallbackContext) -> None:
     """Display help information."""
     help_text = (
@@ -681,13 +754,54 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "• /copy <address> - Copy an existing token\n"
         "• /tokeninfo <address> - Get token info\n"
         "• /help - Show this message\n\n"
-        "During creation you can:\n"
+        "📌 During creation you can:\n"
         "- Preview metadata before submission\n"
         "- Edit any field before finalizing\n"
-        "- Disable selling for 1-7 days\n"
-        "- Revoke authorities after creation"
+        "- Get real-time transaction updates\n"
+        "- View explorer links after creation\n\n"
+        "💡 Pro Tip: Use the inline menus for faster navigation!"
     )
     await update.message.reply_text(help_text)
+
+def main() -> None:
+    """Start the bot with all handlers."""
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Enhanced conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)],
+            MENU: [CallbackQueryHandler(menu_handler)],
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_name)],
+            SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_symbol)],
+            DECIMALS_CHOICE: [
+                CallbackQueryHandler(handle_decimals_choice),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_decimals_input)
+            ],
+            SUPPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_supply)],
+            IMAGE: [
+                CallbackQueryHandler(handle_image_choice),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_image)
+            ],
+            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_description)],
+            PREVIEW: [CallbackQueryHandler(handle_edit_choice)],
+            EDIT_CHOICE: [CallbackQueryHandler(edit_metadata_field)],
+            EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_edited_field)],
+            PHANTOM_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_token_phantom_wallet)],
+            POST_CREATION_ACTIONS: [CallbackQueryHandler(handle_post_creation_actions)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler('copy', copy_token))
+    app.add_handler(CommandHandler('tokeninfo', token_info))
+    app.add_handler(CommandHandler('help', help_command))
+    app.add_error_handler(error_handler)
+    
+    # Start the bot
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
