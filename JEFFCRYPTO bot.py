@@ -25,7 +25,7 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from aiohttp import ClientSession, ClientWebSocketResponse
-from pinatapy import PinataPy
+from pinata_python.pinning import Pinning
 from solana_utils import SolanaUtils
 from solana.publickey import PublicKey
 from functools import lru_cache
@@ -53,9 +53,9 @@ if os.path.exists("admins.json"):
     with open("admins.json", "r") as f:
         ADMIN_IDS.extend(json.load(f))
 
-# Initialize services
+# Initialize services with correct Pinata implementation
+pinata = Pinning(PINATA_API_KEY=PINATA_API_KEY, PINATA_API_SECRET=PINATA_SECRET_API_KEY)
 solana_utils = SolanaUtils(SOLANA_RPC_URL)
-pinata = PinataPy(PINATA_API_KEY, PINATA_SECRET_API_KEY)
 
 # State management
 temporary_storage = {}
@@ -124,8 +124,20 @@ async def upload_to_ipfs(image_url: str) -> Optional[str]:
                     if len(image_data) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
                         return None
                     
-                    result = pinata.pin_file_to_ipfs(image_data)
-                    return f"https://ipfs.io/ipfs/{result['IpfsHash']}"
+                    # Save temp file for Pinata upload
+                    temp_file = f"temp_{int(time.time())}.jpg"
+                    with open(temp_file, 'wb') as f:
+                        f.write(image_data)
+                    
+                    try:
+                        response = pinata.pin_file_to_ipfs(temp_file)
+                        os.remove(temp_file)  # Clean up temp file
+                        return f"https://ipfs.io/ipfs/{response['IpfsHash']}"
+                    except Exception as pinata_error:
+                        logger.error(f"Pinata upload failed: {str(pinata_error)}")
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                        return None
         except Exception as e:
             logger.error(f"Upload attempt {attempt + 1} failed: {str(e)}")
             if attempt < MAX_RETRIES - 1:
@@ -509,7 +521,7 @@ async def create_token_phantom_wallet(update: Update, context: CallbackContext) 
             f"Click below to sign the transaction:\n"
             f"{deep_link}\n\n"
             f"I'll notify you when it's confirmed.",
-            parse_mode="Markdown"
+       parse_mode="Markdown"
         )
         
         return POST_CREATION_ACTIONS
