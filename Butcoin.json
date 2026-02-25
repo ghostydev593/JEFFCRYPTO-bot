@@ -1,0 +1,20 @@
+‎{
+‎  "name": "Butcoin",
+‎  "symbol": "BUT",
+‎  "description": "This is the Bitcoin killer",
+‎  "image": "https://raw.githubusercontent.com/ghostydev593/JEFFCRYPTO-bot/refs/heads/main/IMG_20260225_061658_826.png"
+‎  "attributes": [
+‎    {
+‎      "trait_type": "Category",
+‎      "value": "Meme"
+‎    }
+‎  ],
+‎  "properties": {
+‎    "category": "image",
+‎    "creators": [
+‎      {
+‎        "address": "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm"
+‎      }
+‎    ]
+‎  }
+‎}
