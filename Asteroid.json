@@ -1,0 +1,12 @@
+{
+  "name": "Asteroid",
+  "symbol": "ASTEROID",
+  "description": "Asteroid token",
+  "image": "https://raw.githubusercontent.com/ghostydev593/JEFFCRYPTO-bot/refs/heads/main/600x600%20(3).jpeg",
+  "creators": [
+    {
+      "address": "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm",
+      "share": 100
+    }
+  ]
+}
